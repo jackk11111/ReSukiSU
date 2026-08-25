@@ -96,6 +96,8 @@ data class SettingsUiState(
     val isSuLogEnabled: Boolean = false,
     val selinuxHideStatus: String = "",
     val isSelinuxHideEnabled: Boolean = false,
+    val webViewZygoteUmountStatus: String = "",
+    val isWebViewZygoteUmountEnabled: Boolean = false,
     val defaultUmountModules: Boolean = false,
     val useBuiltinMonoFont: Boolean = false,
 )
@@ -194,6 +196,8 @@ fun initialize() {
                     isSuLogEnabled = features.suLogEnabled,
                     selinuxHideStatus = platform.selinuxHideStatus,
                     isSelinuxHideEnabled = features.selinuxHideEnabled,
+                    webViewZygoteUmountStatus = platform.webViewZygoteUmountStatus,
+                    isWebViewZygoteUmountEnabled = features.isWebViewZygoteUmountEnabled,
                     defaultUmountModules = features.defaultUmountModules,
                 )
             }
