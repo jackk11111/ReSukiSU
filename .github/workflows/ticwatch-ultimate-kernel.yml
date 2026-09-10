@@ -80,8 +80,10 @@ jobs:
           cd kernel_workspace/common
           echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "KERNEL_BASE=$(make -s kernelversion)" >> "$GITHUB_ENV"
-          printf 'Source: %s\nCommit: %s\nKernel: %s\n' \
-            '${{ matrix.source }}' "$(git rev-parse HEAD)" "$(make -s kernelversion)"
+          KMI_GEN=$(sed -n 's/^KMI_GENERATION=//p' build.config.common | head -n1 || true)
+          echo "KMI_GENERATION=${KMI_GEN:-unknown}" >> "$GITHUB_ENV"
+          printf 'Source: %s\nCommit: %s\nKernel: %s\nKMI generation: %s\n' \
+            '${{ matrix.source }}' "$(git rev-parse HEAD)" "$(make -s kernelversion)" "${KMI_GEN:-unknown}"
 
       - name: Integrate latest pinned ReSukiSU
         run: |
@@ -89,6 +91,7 @@ jobs:
           cd kernel_workspace/common
           git clone https://github.com/ReSukiSU/ReSukiSU.git KernelSU
           git -C KernelSU checkout "$RESUKISU_COMMIT"
+          test "$(git -C KernelSU rev-parse HEAD)" = "$RESUKISU_COMMIT"
           ln -sfn "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
           grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
             printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
@@ -100,13 +103,17 @@ jobs:
           set -euxo pipefail
           cd kernel_workspace
           git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs
-          git -C susfs fetch --depth=1 origin "$SUSFS_COMMIT" || true
-          git -C susfs checkout "$SUSFS_COMMIT"
+          SUSFS_RESOLVED_SHA=$(git -C susfs rev-parse HEAD)
+          test "${SUSFS_RESOLVED_SHA:0:8}" = "$SUSFS_COMMIT"
+          echo "SUSFS_RESOLVED_SHA=$SUSFS_RESOLVED_SHA" >> "$GITHUB_ENV"
+          find susfs/kernel_patches -maxdepth 2 -type f -print | sort
           cd common
           cp -af ../susfs/kernel_patches/fs/* fs/
           cp -af ../susfs/kernel_patches/include/linux/* include/linux/
-          test -f ../susfs/kernel_patches/50_add_susfs_in_kernel-5.15.patch
-          patch -p1 --forward < ../susfs/kernel_patches/50_add_susfs_in_kernel-5.15.patch
+          SUSFS_PATCH=$(find ../susfs/kernel_patches -maxdepth 1 -type f -name '50_add_susfs_in_kernel*.patch' | head -n1)
+          test -n "$SUSFS_PATCH"
+          echo "Using SuSFS kernel patch: $SUSFS_PATCH"
+          patch -p1 --forward < "$SUSFS_PATCH"
 
       - name: Generate and harden final config
         run: |
@@ -199,8 +206,9 @@ jobs:
           source_sha=$SOURCE_SHA
           kernel_base=$KERNEL_BASE
           kernel_release=$KERNEL_RELEASE
+          kmi_generation=$KMI_GENERATION
           ReSukiSU=$RESUKISU_COMMIT
-          SuSFS=$SUSFS_COMMIT
+          SuSFS=$SUSFS_RESOLVED_SHA
           hook=SuSFS-inline
           EOF
           (cd AnyKernel3 && zip -qr9 ../TicWatch-Ultimate-${{ matrix.name }}.zip .)
@@ -218,6 +226,8 @@ jobs:
           cp kernel_workspace/common/SHA256SUMS artifacts/${{ matrix.name }}/
           printf '%s\n' "$SOURCE_SHA" > artifacts/${{ matrix.name }}/SOURCE_SHA
           printf '%s\n' "$KERNEL_RELEASE" > artifacts/${{ matrix.name }}/KERNEL_RELEASE
+          printf '%s\n' "$KMI_GENERATION" > artifacts/${{ matrix.name }}/KMI_GENERATION
+          printf '%s\n' "$SUSFS_RESOLVED_SHA" > artifacts/${{ matrix.name }}/SUSFS_SHA
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -249,10 +259,14 @@ jobs:
           awk '$2 != $3 {print}' joined.txt > crc-changes.txt
           COMMON=$(wc -l < joined.txt)
           CHANGED=$(wc -l < crc-changes.txt)
+          OLD_GEN=$(cat old/KMI_GENERATION)
+          NEW_GEN=$(cat new/KMI_GENERATION)
+          echo "KMI generation: old=$OLD_GEN new=$NEW_GEN"
           echo "Common vmlinux symbols: $COMMON"
           echo "CRC changes: $CHANGED"
           head -100 crc-changes.txt || true
-          printf 'common=%s\nchanged=%s\n' "$COMMON" "$CHANGED" > KMI-COMPARE.txt
+          printf 'old_kmi_generation=%s\nnew_kmi_generation=%s\ncommon=%s\nchanged=%s\n' \
+            "$OLD_GEN" "$NEW_GEN" "$COMMON" "$CHANGED" > KMI-COMPARE.txt
       - uses: actions/upload-artifact@v4
         with:
           name: kmi-comparison
