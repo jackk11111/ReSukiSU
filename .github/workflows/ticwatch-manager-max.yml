@@ -28,12 +28,21 @@ jobs:
           git -C src checkout "$RESUKISU_COMMIT"
           test "$(git -C src rev-parse HEAD)" = "$RESUKISU_COMMIT"
 
-      - name: Setup Java and Android SDK
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Rust nightly and cargo-ndk
+        run: |
+          set -euxo pipefail
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup target add --toolchain nightly armv7-linux-androideabi
+          cargo install cargo-ndk --locked
 
       - name: Generate unique package namespace and signing identity
         run: |
@@ -43,7 +52,9 @@ jobs:
           ./randomizer
           PKG=$(sed -n 's/^[[:space:]]*namespace = "\([^"]*\)"/\1/p' app/build.gradle.kts | head -n1)
           test -n "$PKG"
+          test "$PKG" != 'com.resukisu.resukisu'
           PASS=$(openssl rand -hex 24)
+          echo "::add-mask::$PASS"
           keytool -genkeypair \
             -alias ticwatch-unique \
             -keyalg RSA -keysize 3072 \
@@ -61,6 +72,7 @@ jobs:
             echo "KEY_PASSWORD=$PASS"
           } >> gradle.properties
           echo "MANAGER_PACKAGE=$PKG" >> "$GITHUB_ENV"
+          echo "SIGN_PASS=$PASS" >> "$GITHUB_ENV"
 
       - name: Build spoofed release APKs
         run: |
@@ -69,30 +81,70 @@ jobs:
           ./gradlew --no-daemon assembleRelease -Pcommit="$RESUKISU_COMMIT"
           find app/build/outputs/apk/release -type f -name '*.apk' -print
 
-      - name: Extract certificate identity and select Wear armv7 APK
+      - name: Build current armv7 ksud
         run: |
           set -euxo pipefail
-          cd src/manager
-          APK=$(find app/build/outputs/apk/release -type f -name '*armeabi-v7a*release*.apk' | head -n1)
-          if [ -z "$APK" ]; then
-            APK=$(find app/build/outputs/apk/release -type f -name '*.apk' | grep -v universal | head -n1)
-          fi
-          test -s "$APK"
+          cd src
+          clang --target=aarch64-linux-gnu -c -nostdlib \
+            -o userspace/ksud/.lkm_image_bootstrap.o \
+            userspace/ksud/src/lkm_image_bootstrap.S
+          cd userspace/ksud
+          cargo +nightly ndk b -P 26 -t armv7-linux-androideabi -r \
+            -Z build-std-features="optimize_for_size" -Z trim-paths
+          KSUD=$(find target -path '*/armv7-linux-androideabi/release/ksud' -type f | head -n1)
+          test -s "$KSUD"
+          file "$KSUD"
+
+      - name: Repack armv7 manager with armv7 ksud and resign
+        run: |
+          set -euxo pipefail
+          cd src
+          mkdir -p target/armv7-linux-androideabi/release
+          KSUD=$(find userspace/ksud/target -path '*/armv7-linux-androideabi/release/ksud' -type f | head -n1)
+          cp "$KSUD" target/armv7-linux-androideabi/release/ksud
+
+          RELEASE=manager/app/build/outputs/apk/release
+          ARMV7=$(find "$RELEASE" -type f -name '*armeabi-v7a*release*.apk' | head -n1)
+          test -s "$ARMV7"
+          mkdir keep-apk
+          cp "$ARMV7" keep-apk/
+          rm -f "$RELEASE"/*.apk
+          cp keep-apk/*.apk "$RELEASE"/
+
+          python3 repack_apk_multi.py repack \
+            -b release -t release -a armeabi-v7a \
+            -K manager/unique-manager.jks \
+            -A ticwatch-unique \
+            -P "$SIGN_PASS" -S "$SIGN_PASS" \
+            --strip
+          FINAL=$(find dist -maxdepth 1 -type f -name '*.apk' | head -n1)
+          test -s "$FINAL"
+          unzip -l "$FINAL" | grep -q 'lib/armeabi-v7a/libksud.so'
+          unzip -p "$FINAL" lib/armeabi-v7a/libksud.so > /tmp/libksud.so
+          file /tmp/libksud.so | tee /tmp/KSUD-FILE.txt
+          file /tmp/libksud.so | grep -q 'ELF 32-bit'
+
           mkdir -p "$GITHUB_WORKSPACE/manager-artifact"
-          cp "$APK" "$GITHUB_WORKSPACE/manager-artifact/TicWatch-Unique-Manager-armeabi-v7a.apk"
+          cp "$FINAL" "$GITHUB_WORKSPACE/manager-artifact/TicWatch-Unique-Manager-armeabi-v7a.apk"
+
+      - name: Validate APK package certificate and integrity
+        run: |
+          set -euxo pipefail
+          APK="$GITHUB_WORKSPACE/manager-artifact/TicWatch-Unique-Manager-armeabi-v7a.apk"
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n1)
-          "$APKSIGNER" verify --print-certs "$APK" | tee "$GITHUB_WORKSPACE/manager-artifact/APK-CERT.txt"
+          AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n1)
+          test -x "$APKSIGNER"
+          test -x "$AAPT"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee "$GITHUB_WORKSPACE/manager-artifact/APK-CERT.txt"
           CERT_SHA=$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1)
           test -n "$CERT_SHA"
-          printf 'package=%s\nsource=%s\ncert_sha256=%s\nmanager_mode=dynamic-manager-target\npackage_randomized=yes\nsigning_identity=unique-per-build\n' \
-            "$MANAGER_PACKAGE" "$RESUKISU_COMMIT" "$CERT_SHA" > "$GITHUB_WORKSPACE/manager-artifact/MANAGER-IDENTITY.txt"
-          sha256sum "$GITHUB_WORKSPACE/manager-artifact/TicWatch-Unique-Manager-armeabi-v7a.apk" > "$GITHUB_WORKSPACE/manager-artifact/SHA256SUMS"
-
-      - name: Verify package really randomized
-        run: |
-          set -euxo pipefail
-          test "$MANAGER_PACKAGE" != 'com.resukisu.resukisu'
-          ! grep -q '^package=com.resukisu.resukisu$' "$GITHUB_WORKSPACE/manager-artifact/MANAGER-IDENTITY.txt"
+          REAL_PKG=$("$AAPT" dump badging "$APK" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)
+          test "$REAL_PKG" = "$MANAGER_PACKAGE"
+          test "$REAL_PKG" != 'com.resukisu.resukisu'
+          cp /tmp/KSUD-FILE.txt "$GITHUB_WORKSPACE/manager-artifact/KSUD-FILE.txt"
+          printf 'package=%s\nsource=%s\ncert_sha256=%s\nabi=armeabi-v7a\nksud_embedded=yes\nmanager_mode=dynamic-manager-target\npackage_randomized=yes\nsigning_identity=unique-per-build\nprivate_key_retained=no\n' \
+            "$REAL_PKG" "$RESUKISU_COMMIT" "$CERT_SHA" > "$GITHUB_WORKSPACE/manager-artifact/MANAGER-IDENTITY.txt"
+          sha256sum "$APK" > "$GITHUB_WORKSPACE/manager-artifact/SHA256SUMS"
 
       - name: Upload unique manager
         uses: actions/upload-artifact@v4
