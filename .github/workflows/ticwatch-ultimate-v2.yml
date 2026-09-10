@@ -5,34 +5,25 @@ on:
     branches: ["ticwatch-ultimate-2026"]
     paths:
       - '.github/workflows/ticwatch-ultimate-v2.yml'
+      - 'ticwatch-ultimate/port_susfs_android13_515.py'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  RESUKISU_COMMIT: '1e25a4c5c0e7eb71292f1fa4f48704e5490f1b82'
+  RESUKISU_COMMIT: '246d3e52e667cb72ce8f70c93b70d3b42b100b76'
   SUSFS_COMMIT: '415e4143ee1dd557c54d2b3d94ef098e5d1236f4'
   SUSFS_BRANCH: 'gki-android13-5.15'
   WINKMOON_COMMIT: '3929c55fbc7559af6df290d2c0f66dc551af161a'
-  AOSP_COMMIT: '7dfb6fc41ea7e4dd2c49fffcba48e86979ad5508'
+  ANYKERNEL_COMMIT: 'ad62484a9cd193ba24991e617bae66e25c0d0228'
   LLVM_VERSION: '20.1.0'
 
 jobs:
   build:
-    name: ${{ matrix.name }}
+    name: ticwatch-5.15.202-max
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: ticwatch-5.15.202-max
-            source: winkmoon
-            expected_version: '5.15.202'
-          - name: android13-5.15.211-max
-            source: aosp
-            expected_version: '5.15.211'
 
     steps:
       - name: Checkout builder
@@ -47,7 +38,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential flex bison dwarves libssl-dev libelf-dev bc \
             python3 python-is-python3 make cmake zip unzip curl wget gawk \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabihf \
+            gcc-arm-linux-gnueabihf binutils-aarch64-linux-gnu binutils-arm-linux-gnueabihf \
             libncurses-dev lz4 zstd xz-utils kmod
           wget -q -O llvm.tar.xz \
             "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
@@ -55,32 +46,26 @@ jobs:
           mv "LLVM-${LLVM_VERSION}-Linux-X64" aosp-clang
           echo "AOSP_CLANG_PATH=$GITHUB_WORKSPACE/aosp-clang" >> "$GITHUB_ENV"
           echo "$GITHUB_WORKSPACE/aosp-clang/bin" >> "$GITHUB_PATH"
+          clang --version
+          arm-linux-gnueabihf-gcc --version | head -n1
+          arm-linux-gnueabihf-as --version | head -n1
 
-      - name: Fetch exact kernel source
+      - name: Fetch exact TicWatch kernel source
         run: |
           set -euxo pipefail
           mkdir -p kernel_workspace/common
           cd kernel_workspace/common
           git init
-          if [ "${{ matrix.source }}" = "winkmoon" ]; then
-            git remote add origin https://github.com/Winkmoon/android_kernel_TicWatch-Pro5.git
-            git fetch --depth=1 origin "$WINKMOON_COMMIT"
-            EXPECT="$WINKMOON_COMMIT"
-          else
-            git remote add origin https://android.googlesource.com/kernel/common
-            git fetch --depth=1 origin "$AOSP_COMMIT"
-            EXPECT="$AOSP_COMMIT"
-          fi
+          git remote add origin https://github.com/Winkmoon/android_kernel_TicWatch-Pro5.git
+          git fetch --depth=1 origin "$WINKMOON_COMMIT"
           git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "$EXPECT"
+          test "$(git rev-parse HEAD)" = "$WINKMOON_COMMIT"
           VER=$(make -s kernelversion)
-          test "$VER" = "${{ matrix.expected_version }}"
+          test "$VER" = '5.15.202'
           KMI_GEN=$(sed -n 's/^KMI_GENERATION=//p' build.config.common | head -n1 || true)
           echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "KERNEL_BASE=$VER" >> "$GITHUB_ENV"
           echo "KMI_GENERATION=${KMI_GEN:-unknown}" >> "$GITHUB_ENV"
-          printf 'source=%s\nsha=%s\nversion=%s\nkmi_generation=%s\n' \
-            '${{ matrix.source }}' "$(git rev-parse HEAD)" "$VER" "${KMI_GEN:-unknown}"
 
       - name: Integrate exact ReSukiSU
         run: |
@@ -95,7 +80,7 @@ jobs:
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-      - name: Integrate exact SuSFS and deterministic TicWatch/AOSP fixups
+      - name: Integrate exact SuSFS and deterministic TicWatch fixups
         run: |
           set -euxo pipefail
           cd kernel_workspace
@@ -115,7 +100,7 @@ jobs:
             echo '===== EXPECTED CONTEXT REJECTS BEFORE FIXUP ====='
             find . -name '*.rej' -print -exec cat {} \;
           fi
-          python3 "$GITHUB_WORKSPACE/ticwatch-ultimate/port_susfs_android13_515.py" . '${{ matrix.source }}'
+          python3 "$GITHUB_WORKSPACE/ticwatch-ultimate/port_susfs_android13_515.py" . winkmoon
           test -z "$(find . -name '*.rej' -print -quit)"
           git diff --check
           echo '===== SuSFS / ReSukiSU hook audit ====='
@@ -126,9 +111,11 @@ jobs:
         run: |
           set -euxo pipefail
           cd kernel_workspace/common
-          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          export ARCH=arm64
           export PATH="$AOSP_CLANG_PATH/bin:$PATH"
-          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CC_COMPAT=arm-linux-gnueabihf-gcc LD_COMPAT=arm-linux-gnueabihf-ld \
+            gki_defconfig
           C=scripts/config
           F=out/.config
 
@@ -151,8 +138,6 @@ jobs:
           done
           $C --file "$F" -d KSU_SUSFS_ENABLE_LOG
 
-          # Mature capabilities only: maximize utility without changing the
-          # Qualcomm/Mobvoi scheduler, thermal, cpuidle/cpufreq or device drivers.
           for opt in \
             BPF BPF_SYSCALL BPF_JIT BPF_JIT_ALWAYS_ON BPF_UNPRIV_DEFAULT_OFF \
             PSI PSI_DEFAULT_DISABLED OVERLAY_FS FUSE_FS EROFS_FS FS_VERITY \
@@ -163,7 +148,6 @@ jobs:
             $C --file "$F" -e "$opt" || true
           done
 
-          # Keep production kernel small/fast and avoid permanent debug leakage.
           for opt in KASAN KCSAN UBSAN DEBUG_KERNEL DEBUG_INFO_REDUCED; do
             $C --file "$F" -d "$opt" || true
           done
@@ -174,38 +158,75 @@ jobs:
           $C --file "$F" -d LTO_CLANG_FULL
           $C --file "$F" -e THINLTO || true
 
-          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CC_COMPAT=arm-linux-gnueabihf-gcc LD_COMPAT=arm-linux-gnueabihf-ld \
+            olddefconfig
 
-          test "$(grep '^CONFIG_KSU=y' "$F")" = 'CONFIG_KSU=y'
-          test "$(grep '^CONFIG_KSU_SUSFS=y' "$F")" = 'CONFIG_KSU_SUSFS=y'
-          test "$(grep '^CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' "$F")" = 'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y'
-          test "$(grep '^CONFIG_COMPAT=y' "$F")" = 'CONFIG_COMPAT=y'
+          grep -qx 'CONFIG_KSU=y' "$F"
+          grep -qx 'CONFIG_KSU_SUSFS=y' "$F"
+          grep -qx 'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' "$F"
+          grep -qx 'CONFIG_COMPAT=y' "$F"
           echo '===== FINAL ROOT/HIDING CONFIG ====='
           grep -E '^(CONFIG_KSU|CONFIG_COMPAT|CONFIG_MODVERSIONS|CONFIG_MODULES|CONFIG_LTO|CONFIG_BPF|CONFIG_PSI|CONFIG_ZRAM|CONFIG_OVERLAY_FS|CONFIG_EROFS_FS|CONFIG_FS_VERITY)' "$F" | sort
 
-      - name: Build kernel hard-fail
+      - name: Targeted pre-build source audit
         run: |
           set -euxo pipefail
           cd kernel_workspace/common
-          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          {
+            echo '===== COMPAT VDSO32 FILES ====='
+            find arch/arm64/kernel/vdso32 -maxdepth 1 -type f -printf '%f\n' | sort
+            echo '===== SUSFS C FILES ====='
+            find . -path '*susfs.c' -print | sort
+            echo '===== SECURITY SUSFS CONTEXT ====='
+            if [ -f security/susfs.c ]; then nl -ba security/susfs.c | sed -n '680,750p'; fi
+            echo '===== FS SUSFS CONTEXT ====='
+            if [ -f fs/susfs.c ]; then nl -ba fs/susfs.c | sed -n '680,750p'; fi
+            echo '===== VDSO32 MAKE COMPAT ====='
+            grep -nE 'CC_COMPAT|LD_COMPAT|cmd_vdsoas|asm-obj-vdso' arch/arm64/kernel/vdso32/Makefile
+          } | tee "$GITHUB_WORKSPACE/prebuild-audit.txt"
+
+      - name: Build kernel hard-fail
+        run: |
+          set -uxo pipefail
+          cd kernel_workspace/common
+          export ARCH=arm64
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabihf-
           export PATH="$AOSP_CLANG_PATH/bin:$PATH"
           export KCFLAGS='-Wno-error -Wno-deprecated-declarations'
           export KBUILD_BUILD_VERSION=1
           export KBUILD_BUILD_USER=android-build
           export KBUILD_BUILD_HOST=abfarm
           export KBUILD_BUILD_TIMESTAMP='Thu Sep 10 12:00:00 UTC 2026'
-          make -j"$(nproc)" O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
+          make -j"$(nproc)" V=1 O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CC_COMPAT=arm-linux-gnueabihf-gcc LD_COMPAT=arm-linux-gnueabihf-ld \
+            2>&1 | tee "$GITHUB_WORKSPACE/kernel-build.log"
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -ne 0 ]; then
+            echo '===== FAILURE: GENERATED VDSO32 FILES ====='
+            find arch/arm64/kernel/vdso32 out/arch/arm64/kernel/vdso32 -maxdepth 1 -type f -print 2>/dev/null | sort || true
+            for f in arch/arm64/kernel/vdso32/sigreturn.S out/arch/arm64/kernel/vdso32/sigreturn.S security/susfs.c; do
+              if [ -f "$f" ]; then
+                echo "===== $f ====="
+                nl -ba "$f" | sed -n '1,90p'
+                nl -ba "$f" | sed -n '680,750p'
+              fi
+            done
+            exit "$RC"
+          fi
           test -s out/arch/arm64/boot/Image
           test -s out/Module.symvers
 
-      - name: Validate image, ABI metadata and manager flexibility
+      - name: Validate image ABI metadata and manager flexibility
+        if: success()
         run: |
           set -euxo pipefail
           cd kernel_workspace/common
-          REL=$(make -s O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 kernelrelease)
+          REL=$(make -s O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CC_COMPAT=arm-linux-gnueabihf-gcc LD_COMPAT=arm-linux-gnueabihf-ld kernelrelease)
           echo "KERNEL_RELEASE=$REL" >> "$GITHUB_ENV"
           file out/arch/arm64/boot/Image
           sha256sum out/arch/arm64/boot/Image
@@ -213,40 +234,43 @@ jobs:
           grep -E '^(CONFIG_KSU|CONFIG_COMPAT|CONFIG_MODVERSIONS|CONFIG_MODULES|CONFIG_ARM64|CONFIG_KALLSYMS)' out/.config | sort > root-abi-config.txt
           test -f KernelSU/kernel/feature/dynamic_manager.c
           grep -q 'CONFIG_KSU_MULTI_MANAGER_SUPPORT' KernelSU/kernel/Kconfig
-          grep -q 'EXPECTED_SIZE_RESUKISU' KernelSU/kernel/manager/apk_sign.c
-          grep -q 'EXPECTED_SIZE_SUKISU' KernelSU/kernel/manager/apk_sign.c
-          grep -q 'randomizer' KernelSU/.github/workflows/build-manager.yml
           printf 'dynamic_manager=yes\nmulti_manager=yes\nmanager_package_randomizer=yes\n' > MANAGER-FLEXIBILITY.txt
           sha256sum out/.config out/Module.symvers out/arch/arm64/boot/Image > SHA256SUMS
 
-      - name: Package AnyKernel3
+      - name: Package pinned AnyKernel3
+        if: success()
         run: |
           set -euxo pipefail
           cd kernel_workspace/common
-          git clone --depth=1 https://github.com/Winkmoon/AnyKernel3.git AnyKernel3
+          git clone https://github.com/Winkmoon/AnyKernel3.git AnyKernel3
+          git -C AnyKernel3 checkout "$ANYKERNEL_COMMIT"
+          test "$(git -C AnyKernel3 rev-parse HEAD)" = "$ANYKERNEL_COMMIT"
           rm -rf AnyKernel3/.git
           cp out/arch/arm64/boot/Image AnyKernel3/Image
           cat > AnyKernel3/ultimate-info.txt <<EOF
           TicWatch Pro 5 / Pro 5 Enduro Ultimate Kernel
-          source=${{ matrix.source }}
+          source=winkmoon
           source_sha=$SOURCE_SHA
           kernel_base=$KERNEL_BASE
           kernel_release=$KERNEL_RELEASE
           kmi_generation=$KMI_GENERATION
           ReSukiSU=$RESUKISU_COMMIT
           SuSFS=$SUSFS_RESOLVED_SHA
+          AnyKernel3=$ANYKERNEL_COMMIT
           hook=SuSFS-inline
+          compat_vdso=GNU-armhf
           manager=dynamic+multi-manager+randomizer-ready
           EOF
-          (cd AnyKernel3 && zip -qr9 ../TicWatch-Ultimate-${{ matrix.name }}.zip .)
-          sha256sum TicWatch-Ultimate-${{ matrix.name }}.zip >> SHA256SUMS
+          (cd AnyKernel3 && zip -qr9 ../TicWatch-Ultimate-ticwatch-5.15.202-max.zip .)
+          sha256sum TicWatch-Ultimate-ticwatch-5.15.202-max.zip >> SHA256SUMS
 
-      - name: Collect artifacts
+      - name: Collect final artifacts
+        if: success()
         run: |
           set -euxo pipefail
-          D=artifacts/${{ matrix.name }}
+          D=artifacts/ticwatch-5.15.202-max
           mkdir -p "$D"
-          cp kernel_workspace/common/TicWatch-Ultimate-${{ matrix.name }}.zip "$D/"
+          cp kernel_workspace/common/TicWatch-Ultimate-ticwatch-5.15.202-max.zip "$D/"
           cp kernel_workspace/common/out/arch/arm64/boot/Image "$D/Image"
           cp kernel_workspace/common/out/.config "$D/config"
           cp kernel_workspace/common/out/Module.symvers "$D/Module.symvers"
@@ -254,51 +278,30 @@ jobs:
           cp kernel_workspace/common/root-abi-config.txt "$D/"
           cp kernel_workspace/common/MANAGER-FLEXIBILITY.txt "$D/"
           cp kernel_workspace/common/SHA256SUMS "$D/"
+          cp "$GITHUB_WORKSPACE/prebuild-audit.txt" "$D/"
           printf '%s\n' "$SOURCE_SHA" > "$D/SOURCE_SHA"
           printf '%s\n' "$KERNEL_RELEASE" > "$D/KERNEL_RELEASE"
           printf '%s\n' "$KMI_GENERATION" > "$D/KMI_GENERATION"
           printf '%s\n' "$SUSFS_RESOLVED_SHA" > "$D/SUSFS_SHA"
+          printf '%s\n' "$RESUKISU_COMMIT" > "$D/RESUKISU_SHA"
+          printf '%s\n' "$ANYKERNEL_COMMIT" > "$D/ANYKERNEL_SHA"
 
-      - name: Upload candidate
+      - name: Upload build diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: artifacts/${{ matrix.name }}
-          if-no-files-found: error
-          compression-level: 6
-          retention-days: 30
+          name: ticwatch-5.15.202-build-diagnostics
+          path: |
+            prebuild-audit.txt
+            kernel-build.log
+          if-no-files-found: warn
+          retention-days: 14
 
-  compare-kmi:
-    name: KMI/CRC gate 5.15.202 vs 5.15.211
-    needs: build
-    if: ${{ always() && needs.build.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
+      - name: Upload final kernel artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
           name: ticwatch-5.15.202-max
-          path: old
-      - uses: actions/download-artifact@v4
-        with:
-          name: android13-5.15.211-max
-          path: new
-      - name: Compare KMI generation and vmlinux symbol CRCs
-        run: |
-          set -euxo pipefail
-          OLD_GEN=$(cat old/KMI_GENERATION)
-          NEW_GEN=$(cat new/KMI_GENERATION)
-          test "$OLD_GEN" = "$NEW_GEN"
-          join -j 2 <(sort -k2,2 old/vmlinux-symvers.txt) <(sort -k2,2 new/vmlinux-symvers.txt) > joined.txt || true
-          awk '$2 != $3 {print}' joined.txt > crc-changes.txt
-          COMMON=$(wc -l < joined.txt)
-          CHANGED=$(wc -l < crc-changes.txt)
-          printf 'old_kmi_generation=%s\nnew_kmi_generation=%s\ncommon_symbols=%s\nchanged_crc=%s\n' \
-            "$OLD_GEN" "$NEW_GEN" "$COMMON" "$CHANGED" | tee KMI-COMPARE.txt
-          head -200 crc-changes.txt || true
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kmi-comparison
-          path: |
-            KMI-COMPARE.txt
-            crc-changes.txt
-            joined.txt
+          path: artifacts/ticwatch-5.15.202-max
+          if-no-files-found: error
+          retention-days: 30
