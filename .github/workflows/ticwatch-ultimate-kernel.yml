@@ -12,12 +12,12 @@ permissions:
   contents: read
 
 env:
-  RESUKISU_COMMIT: 1e25a4c5c0e7eb71292f1fa4f48704e5490f1b82
-  SUSFS_COMMIT: 415e4143
-  SUSFS_BRANCH: gki-android13-5.15
-  WINKMOON_BRANCH: master-ksu-manual_hook
-  AOSP_BRANCH: android13-5.15-2026-09
-  LLVM_VERSION: 20.1.0
+  RESUKISU_COMMIT: '1e25a4c5c0e7eb71292f1fa4f48704e5490f1b82'
+  SUSFS_COMMIT: '415e4143'
+  SUSFS_BRANCH: 'gki-android13-5.15'
+  WINKMOON_BRANCH: 'master-ksu-manual_hook'
+  AOSP_BRANCH: 'android13-5.15-2026-09'
+  LLVM_VERSION: '20.1.0'
 
 jobs:
   build:
@@ -136,8 +136,6 @@ jobs:
           done
           $C --file "$F" -d KSU_SUSFS_ENABLE_LOG
 
-          # Preserve Android GKI behaviour while enabling only mature, low-risk
-          # capabilities that are useful on a watch when the source supports them.
           for opt in BPF BPF_SYSCALL BPF_JIT PSI OVERLAY_FS FUSE_FS EROFS_FS \
                      FS_VERITY IPV6 NETFILTER; do
             $C --file "$F" -e "$opt" || true
@@ -185,7 +183,7 @@ jobs:
           echo "Kernel release: $REL"
           grep -E '^(CONFIG_KSU|CONFIG_MODVERSIONS|CONFIG_MODULES|CONFIG_ARM64|CONFIG_COMPAT|CONFIG_KALLSYMS)' out/.config | sort
           test -s out/Module.symvers
-          awk '$3=="vmlinux" {print $1, $2}' out/Module.symvers | sort -k2 > vmlinux-symvers.txt
+          awk '$3=="vmlinux" {print $1, $2}' out/Module.symvers | sort -k2,2 > vmlinux-symvers.txt
           sha256sum out/.config out/Module.symvers out/arch/arm64/boot/Image > SHA256SUMS
 
       - name: Package AnyKernel3
@@ -247,7 +245,7 @@ jobs:
       - name: Compare common vmlinux symbol CRCs
         run: |
           set -euxo pipefail
-          join -j 2 <(sort -k2 old/vmlinux-symvers.txt) <(sort -k2 new/vmlinux-symvers.txt) > joined.txt || true
+          join -j 2 <(sort -k2,2 old/vmlinux-symvers.txt) <(sort -k2,2 new/vmlinux-symvers.txt) > joined.txt || true
           awk '$2 != $3 {print}' joined.txt > crc-changes.txt
           COMMON=$(wc -l < joined.txt)
           CHANGED=$(wc -l < crc-changes.txt)
