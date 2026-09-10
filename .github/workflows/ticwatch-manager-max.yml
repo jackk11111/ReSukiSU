@@ -136,8 +136,8 @@ jobs:
           test -x "$APKSIGNER"
           test -x "$AAPT"
           "$APKSIGNER" verify --verbose --print-certs "$APK" | tee "$GITHUB_WORKSPACE/manager-artifact/APK-CERT.txt"
-          CERT_SHA=$("$APKSIGNER" verify --print-certs "$APK" | sed -nE 's/^(V[0-9]+[[:space:]]+)?Signer #1 certificate SHA-256 digest:[[:space:]]*([0-9a-fA-F]{64})[[:space:]]*$/\2/p' | head -n1 | tr '[:upper:]' '[:lower:]')
-          test -n "$CERT_SHA"
+          CERT_SHA=$("$APKSIGNER" verify --print-certs "$APK" | awk -F': ' '/certificate SHA-256 digest:/ {print $NF; exit}' | tr '[:upper:]' '[:lower:]')
+          [[ "$CERT_SHA" =~ ^[0-9a-f]{64}$ ]]
           REAL_PKG=$("$AAPT" dump badging "$APK" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)
           test "$REAL_PKG" = "$MANAGER_PACKAGE"
           test "$REAL_PKG" != 'com.resukisu.resukisu'
