@@ -13,7 +13,7 @@ permissions:
 
 env:
   RESUKISU_COMMIT: '1e25a4c5c0e7eb71292f1fa4f48704e5490f1b82'
-  SUSFS_COMMIT: '415e4143'
+  SUSFS_COMMIT: '415e4143ee1dd557c54d2b3d94ef098e5d1236f4'
   SUSFS_BRANCH: 'gki-android13-5.15'
   WINKMOON_BRANCH: 'master-ksu-manual_hook'
   AOSP_BRANCH: 'android13-5.15-2026-09'
@@ -104,15 +104,13 @@ jobs:
           cd kernel_workspace
           git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs
           SUSFS_RESOLVED_SHA=$(git -C susfs rev-parse HEAD)
-          test "${SUSFS_RESOLVED_SHA:0:8}" = "$SUSFS_COMMIT"
+          test "$SUSFS_RESOLVED_SHA" = "$SUSFS_COMMIT"
           echo "SUSFS_RESOLVED_SHA=$SUSFS_RESOLVED_SHA" >> "$GITHUB_ENV"
-          find susfs/kernel_patches -maxdepth 2 -type f -print | sort
           cd common
           cp -af ../susfs/kernel_patches/fs/* fs/
           cp -af ../susfs/kernel_patches/include/linux/* include/linux/
-          SUSFS_PATCH=$(find ../susfs/kernel_patches -maxdepth 1 -type f -name '50_add_susfs_in_kernel*.patch' | head -n1)
-          test -n "$SUSFS_PATCH"
-          echo "Using SuSFS kernel patch: $SUSFS_PATCH"
+          SUSFS_PATCH=../susfs/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch
+          test -f "$SUSFS_PATCH"
           patch -p1 --forward < "$SUSFS_PATCH"
 
       - name: Generate and harden final config
@@ -173,8 +171,8 @@ jobs:
           export LLVM=1 LLVM_IAS=1
           export KCFLAGS='-Wno-error -Wno-deprecated-declarations'
           export KBUILD_BUILD_VERSION=1
-          export KBUILD_BUILD_USER=Ultimate
-          export KBUILD_BUILD_HOST=TicWatch
+          export KBUILD_BUILD_USER=android-build
+          export KBUILD_BUILD_HOST=abfarm
           export KBUILD_BUILD_TIMESTAMP='Thu Sep 10 12:00:00 UTC 2026'
           make -j"$(nproc)" O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
           test -s out/arch/arm64/boot/Image
