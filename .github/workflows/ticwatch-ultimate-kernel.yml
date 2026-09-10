@@ -1,0 +1,263 @@
+name: TicWatch Ultimate Kernel
+
+on:
+  push:
+    branches: ["ticwatch-ultimate-2026"]
+    paths:
+      - '.github/workflows/ticwatch-ultimate-kernel.yml'
+      - 'ticwatch-ultimate/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RESUKISU_COMMIT: 1e25a4c5c0e7eb71292f1fa4f48704e5490f1b82
+  SUSFS_COMMIT: 415e4143
+  SUSFS_BRANCH: gki-android13-5.15
+  WINKMOON_BRANCH: master-ksu-manual_hook
+  AOSP_BRANCH: android13-5.15-2026-09
+  LLVM_VERSION: 20.1.0
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: known-base-5.15.202-susfs
+            source: winkmoon
+          - name: latest-android13-5.15-susfs
+            source: aosp
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'false'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison dwarves libssl-dev libelf-dev bc \
+            python3 python-is-python3 make cmake zip unzip curl wget gnupg \
+            gawk gcc-multilib g++-multilib ccache rsync \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabihf \
+            libncurses-dev lz4 zstd xz-utils kmod
+          wget -q -O llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
+          tar -xf llvm.tar.xz
+          mv "LLVM-${LLVM_VERSION}-Linux-X64" aosp-clang
+          echo "AOSP_CLANG_PATH=$GITHUB_WORKSPACE/aosp-clang" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/aosp-clang/bin" >> "$GITHUB_PATH"
+
+      - name: Clone kernel source
+        run: |
+          set -euxo pipefail
+          mkdir -p kernel_workspace
+          if [ "${{ matrix.source }}" = "winkmoon" ]; then
+            git clone --depth=1 -b "$WINKMOON_BRANCH" \
+              https://github.com/Winkmoon/android_kernel_TicWatch-Pro5.git \
+              kernel_workspace/common
+          else
+            git clone --depth=1 -b "$AOSP_BRANCH" \
+              https://android.googlesource.com/kernel/common \
+              kernel_workspace/common
+          fi
+          cd kernel_workspace/common
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "KERNEL_BASE=$(make -s kernelversion)" >> "$GITHUB_ENV"
+          printf 'Source: %s\nCommit: %s\nKernel: %s\n' \
+            '${{ matrix.source }}' "$(git rev-parse HEAD)" "$(make -s kernelversion)"
+
+      - name: Integrate latest pinned ReSukiSU
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace/common
+          git clone https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          git -C KernelSU checkout "$RESUKISU_COMMIT"
+          ln -sfn "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+      - name: Integrate pinned SuSFS kernel side
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace
+          git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs
+          git -C susfs fetch --depth=1 origin "$SUSFS_COMMIT" || true
+          git -C susfs checkout "$SUSFS_COMMIT"
+          cd common
+          cp -af ../susfs/kernel_patches/fs/* fs/
+          cp -af ../susfs/kernel_patches/include/linux/* include/linux/
+          test -f ../susfs/kernel_patches/50_add_susfs_in_kernel-5.15.patch
+          patch -p1 --forward < ../susfs/kernel_patches/50_add_susfs_in_kernel-5.15.patch
+
+      - name: Generate and harden final config
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace/common
+          export ARCH=arm64
+          export LLVM=1 LLVM_IAS=1
+          export PATH="$AOSP_CLANG_PATH/bin:$PATH"
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
+
+          C=scripts/config
+          F=out/.config
+          $C --file "$F" -e KSU
+          $C --file "$F" -d KSU_TRACEPOINT_HOOK
+          $C --file "$F" -d KSU_MANUAL_HOOK
+          $C --file "$F" -e KSU_SUSFS
+          $C --file "$F" -e KSU_MULTI_MANAGER_SUPPORT
+          $C --file "$F" -d KSU_DEBUG
+          $C --file "$F" -d KSU_TOOLKIT_SUPPORT
+
+          for opt in \
+            KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
+            KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT \
+            KSU_SUSFS_SUS_MAP; do
+            $C --file "$F" -e "$opt"
+          done
+          $C --file "$F" -d KSU_SUSFS_ENABLE_LOG
+
+          # Preserve Android GKI behaviour while enabling only mature, low-risk
+          # capabilities that are useful on a watch when the source supports them.
+          for opt in BPF BPF_SYSCALL BPF_JIT PSI OVERLAY_FS FUSE_FS EROFS_FS \
+                     FS_VERITY IPV6 NETFILTER; do
+            $C --file "$F" -e "$opt" || true
+          done
+
+          $C --file "$F" -e LTO_CLANG
+          $C --file "$F" -d LTO_NONE
+          $C --file "$F" -e LTO_CLANG_THIN
+          $C --file "$F" -d LTO_CLANG_FULL
+          $C --file "$F" -e THINLTO || true
+
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+
+          echo '===== ULTIMATE CONFIG ====='
+          grep -E '^(CONFIG_KSU|CONFIG_BPF|CONFIG_PSI|CONFIG_OVERLAY_FS|CONFIG_FUSE_FS|CONFIG_EROFS_FS|CONFIG_FS_VERITY|CONFIG_IPV6|CONFIG_NETFILTER|CONFIG_LTO|CONFIG_THINLTO)' "$F" | sort
+          test "$(grep '^CONFIG_KSU=y' "$F")" = 'CONFIG_KSU=y'
+          test "$(grep '^CONFIG_KSU_SUSFS=y' "$F")" = 'CONFIG_KSU_SUSFS=y'
+
+      - name: Build kernel
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace/common
+          export ARCH=arm64
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
+          export PATH="$AOSP_CLANG_PATH/bin:$PATH"
+          export LLVM=1 LLVM_IAS=1
+          export KCFLAGS='-Wno-error -Wno-deprecated-declarations'
+          export KBUILD_BUILD_VERSION=1
+          export KBUILD_BUILD_USER=Ultimate
+          export KBUILD_BUILD_HOST=TicWatch
+          export KBUILD_BUILD_TIMESTAMP='Thu Sep 10 12:00:00 UTC 2026'
+          make -j"$(nproc)" O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
+          test -s out/arch/arm64/boot/Image
+          file out/arch/arm64/boot/Image
+          sha256sum out/arch/arm64/boot/Image
+
+      - name: Validate build and KMI metadata
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace/common
+          REL=$(make -s O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 kernelrelease)
+          echo "KERNEL_RELEASE=$REL" >> "$GITHUB_ENV"
+          echo "Kernel release: $REL"
+          grep -E '^(CONFIG_KSU|CONFIG_MODVERSIONS|CONFIG_MODULES|CONFIG_ARM64|CONFIG_COMPAT|CONFIG_KALLSYMS)' out/.config | sort
+          test -s out/Module.symvers
+          awk '$3=="vmlinux" {print $1, $2}' out/Module.symvers | sort -k2 > vmlinux-symvers.txt
+          sha256sum out/.config out/Module.symvers out/arch/arm64/boot/Image > SHA256SUMS
+
+      - name: Package AnyKernel3
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace/common
+          git clone --depth=1 https://github.com/Winkmoon/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git
+          cp out/arch/arm64/boot/Image AnyKernel3/Image
+          cat > AnyKernel3/ultimate-info.txt <<EOF
+          TicWatch Pro 5 / Pro 5 Enduro Ultimate Kernel
+          source=${{ matrix.source }}
+          source_sha=$SOURCE_SHA
+          kernel_base=$KERNEL_BASE
+          kernel_release=$KERNEL_RELEASE
+          ReSukiSU=$RESUKISU_COMMIT
+          SuSFS=$SUSFS_COMMIT
+          hook=SuSFS-inline
+          EOF
+          (cd AnyKernel3 && zip -qr9 ../TicWatch-Ultimate-${{ matrix.name }}.zip .)
+          sha256sum TicWatch-Ultimate-${{ matrix.name }}.zip >> SHA256SUMS
+
+      - name: Collect artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/${{ matrix.name }}
+          cp kernel_workspace/common/TicWatch-Ultimate-${{ matrix.name }}.zip artifacts/${{ matrix.name }}/
+          cp kernel_workspace/common/out/arch/arm64/boot/Image artifacts/${{ matrix.name }}/Image
+          cp kernel_workspace/common/out/.config artifacts/${{ matrix.name }}/config
+          cp kernel_workspace/common/out/Module.symvers artifacts/${{ matrix.name }}/Module.symvers
+          cp kernel_workspace/common/vmlinux-symvers.txt artifacts/${{ matrix.name }}/
+          cp kernel_workspace/common/SHA256SUMS artifacts/${{ matrix.name }}/
+          printf '%s\n' "$SOURCE_SHA" > artifacts/${{ matrix.name }}/SOURCE_SHA
+          printf '%s\n' "$KERNEL_RELEASE" > artifacts/${{ matrix.name }}/KERNEL_RELEASE
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: artifacts/${{ matrix.name }}
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
+
+  compare-kmi:
+    name: Compare 5.15.202 vs latest KMI
+    needs: build
+    if: ${{ always() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: known-base-5.15.202-susfs
+          path: old
+      - uses: actions/download-artifact@v4
+        with:
+          name: latest-android13-5.15-susfs
+          path: new
+      - name: Compare common vmlinux symbol CRCs
+        run: |
+          set -euxo pipefail
+          join -j 2 <(sort -k2 old/vmlinux-symvers.txt) <(sort -k2 new/vmlinux-symvers.txt) > joined.txt || true
+          awk '$2 != $3 {print}' joined.txt > crc-changes.txt
+          COMMON=$(wc -l < joined.txt)
+          CHANGED=$(wc -l < crc-changes.txt)
+          echo "Common vmlinux symbols: $COMMON"
+          echo "CRC changes: $CHANGED"
+          head -100 crc-changes.txt || true
+          printf 'common=%s\nchanged=%s\n' "$COMMON" "$CHANGED" > KMI-COMPARE.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmi-comparison
+          path: |
+            KMI-COMPARE.txt
+            crc-changes.txt
