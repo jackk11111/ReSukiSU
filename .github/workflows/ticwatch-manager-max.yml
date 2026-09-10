@@ -1,0 +1,103 @@
+name: TicWatch Manager Max
+
+on:
+  push:
+    branches: ["ticwatch-ultimate-2026"]
+    paths:
+      - '.github/workflows/ticwatch-manager-max.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RESUKISU_COMMIT: '246d3e52e667cb72ce8f70c93b70d3b42b100b76'
+
+jobs:
+  build-spoofed-manager:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Fetch exact latest ReSukiSU source
+        run: |
+          set -euxo pipefail
+          git clone https://github.com/ReSukiSU/ReSukiSU.git src
+          git -C src checkout "$RESUKISU_COMMIT"
+          test "$(git -C src rev-parse HEAD)" = "$RESUKISU_COMMIT"
+
+      - name: Setup Java and Android SDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+
+      - name: Generate unique package namespace and signing identity
+        run: |
+          set -euxo pipefail
+          cd src/manager
+          chmod +x randomizer
+          ./randomizer
+          PKG=$(sed -n 's/^[[:space:]]*namespace = "\([^"]*\)"/\1/p' app/build.gradle.kts | head -n1)
+          test -n "$PKG"
+          PASS=$(openssl rand -hex 24)
+          keytool -genkeypair \
+            -alias ticwatch-unique \
+            -keyalg RSA -keysize 3072 \
+            -sigalg SHA256withRSA \
+            -validity 3650 \
+            -storetype JKS \
+            -keystore unique-manager.jks \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -dname "CN=Android,O=Mobile,L=Rome,C=IT"
+          {
+            echo "KEYSTORE_FILE=unique-manager.jks"
+            echo "KEYSTORE_PASSWORD=$PASS"
+            echo "KEY_ALIAS=ticwatch-unique"
+            echo "KEY_PASSWORD=$PASS"
+          } >> gradle.properties
+          echo "MANAGER_PACKAGE=$PKG" >> "$GITHUB_ENV"
+
+      - name: Build spoofed release APKs
+        run: |
+          set -euxo pipefail
+          cd src/manager
+          ./gradlew --no-daemon assembleRelease -Pcommit="$RESUKISU_COMMIT"
+          find app/build/outputs/apk/release -type f -name '*.apk' -print
+
+      - name: Extract certificate identity and select Wear armv7 APK
+        run: |
+          set -euxo pipefail
+          cd src/manager
+          APK=$(find app/build/outputs/apk/release -type f -name '*armeabi-v7a*release*.apk' | head -n1)
+          if [ -z "$APK" ]; then
+            APK=$(find app/build/outputs/apk/release -type f -name '*.apk' | grep -v universal | head -n1)
+          fi
+          test -s "$APK"
+          mkdir -p "$GITHUB_WORKSPACE/manager-artifact"
+          cp "$APK" "$GITHUB_WORKSPACE/manager-artifact/TicWatch-Unique-Manager-armeabi-v7a.apk"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n1)
+          "$APKSIGNER" verify --print-certs "$APK" | tee "$GITHUB_WORKSPACE/manager-artifact/APK-CERT.txt"
+          CERT_SHA=$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1)
+          test -n "$CERT_SHA"
+          printf 'package=%s\nsource=%s\ncert_sha256=%s\nmanager_mode=dynamic-manager-target\npackage_randomized=yes\nsigning_identity=unique-per-build\n' \
+            "$MANAGER_PACKAGE" "$RESUKISU_COMMIT" "$CERT_SHA" > "$GITHUB_WORKSPACE/manager-artifact/MANAGER-IDENTITY.txt"
+          sha256sum "$GITHUB_WORKSPACE/manager-artifact/TicWatch-Unique-Manager-armeabi-v7a.apk" > "$GITHUB_WORKSPACE/manager-artifact/SHA256SUMS"
+
+      - name: Verify package really randomized
+        run: |
+          set -euxo pipefail
+          test "$MANAGER_PACKAGE" != 'com.resukisu.resukisu'
+          ! grep -q '^package=com.resukisu.resukisu$' "$GITHUB_WORKSPACE/manager-artifact/MANAGER-IDENTITY.txt"
+
+      - name: Upload unique manager
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticwatch-unique-spoofed-manager
+          path: manager-artifact
+          if-no-files-found: error
+          retention-days: 30
